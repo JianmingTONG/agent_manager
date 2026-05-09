@@ -56,6 +56,67 @@ SENTINEL_RE = re.compile(
 )
 END_EXECUTOR = "END_EXECUTOR"
 
+# Patterns that identify claude-code / codex UI chrome we want to strip out
+# of executor pane captures before forwarding the reply to the controller.
+# These are intentionally aggressive about box-drawing / spinner glyphs --
+# real shell command output rarely contains them, while every CLI agent's UI
+# chrome does.
+_HORIZONTAL_RULE_RE = re.compile(r"^\s*[─-╿\-=_]{12,}\s*$")
+_CHROME_PATTERNS = [
+    # claude-code feedback prompt
+    re.compile(r"^\s*●?\s*How is Claude doing this session\?"),
+    re.compile(
+        r"^\s*\d+\s*:\s*(Bad|Fine|Good|Dismiss)"
+        r"(\s+\d+\s*:\s*\w+)*\s*$"
+    ),
+    # claude-code permission-mode hint and token-usage hint
+    re.compile(r"⏵⏵\s+bypass permissions"),
+    re.compile(r"new task\?\s+/clear to save"),
+    re.compile(r"shift\+tab to cycle"),
+    # claude-code thinking spinner: "✻ Crunched for 9m 30s",
+    # "✶ Tinkering for 12s", "✳ Pondering ..." etc. claude rotates through
+    # several dingbat glyphs; cover the ones it actually uses.
+    re.compile(r"^\s*[✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀❁❂❃✦✧·\*]\s+\S.*$"),
+    # empty input-box prompt symbols
+    re.compile(r"^\s*[❯›]\s*$"),
+    # codex header / placeholder lines
+    re.compile(r"^\s*[❯›]\s+(Improve documentation|Try |Ask |Type )"),
+    re.compile(r"^\s*gpt-[0-9.]+\s+\w+\s+·\s+"),
+    re.compile(r"^\s*>_\s+OpenAI Codex"),
+    # any line that begins with a box-drawing vertical/corner glyph
+    re.compile(r"^\s*[│┃┌┐└┘├┤"
+               r"┬┴┼═║╔╗╚╝"
+               r"╭╮╯╰]"),
+]
+
+
+def clean_pane_text(text: str) -> str:
+    """Drop UI chrome (separators, spinners, feedback prompts) from a captured
+    pane so we don't poison the controller's context when forwarding."""
+    kept: list[str] = []
+    for line in text.splitlines():
+        if _HORIZONTAL_RULE_RE.match(line):
+            continue
+        if any(p.search(line) for p in _CHROME_PATTERNS):
+            continue
+        kept.append(line.rstrip())
+    # collapse runs of blank lines to a single blank
+    collapsed: list[str] = []
+    blanks = 0
+    for ln in kept:
+        if not ln.strip():
+            blanks += 1
+            if blanks <= 1:
+                collapsed.append("")
+        else:
+            blanks = 0
+            collapsed.append(ln)
+    while collapsed and not collapsed[0].strip():
+        collapsed.pop(0)
+    while collapsed and not collapsed[-1].strip():
+        collapsed.pop()
+    return "\n".join(collapsed)
+
 KICKOFF = """\
 You are now CONTROLLER in an agent-manager loop. A separate program (the
 manager) reads this pane and will keep you running until the goal is met
@@ -92,6 +153,7 @@ Rules:
     then either another EXECUTOR block or DONE/BLOCKED.
   - Be terse. STATUS/NOTE lines go into a global memory file -- write as
     little as possible while staying useful.
+  - Make concise suggestions, as necessary as needed and as minimal as possible.
   - Tagged lines must start at column 0; no leading prose on the same
     line as a tag.
 
@@ -238,7 +300,7 @@ def relay_executor(
             last = cur
     cur_lines = last.splitlines()
     new = cur_lines[pre_count:] if len(cur_lines) > pre_count else cur_lines
-    return "\n".join(new).rstrip()
+    return clean_pane_text("\n".join(new))
 
 
 def now_iso() -> str:
