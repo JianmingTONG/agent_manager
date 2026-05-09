@@ -58,34 +58,42 @@ END_EXECUTOR = "END_EXECUTOR"
 
 KICKOFF = """\
 You are now CONTROLLER in an agent-manager loop. A separate program (the
-manager) reads this pane and will keep you running until you finish.
+manager) reads this pane and will keep you running until the goal is met
+or determined unreachable.
 
 GOAL:
 {goal}
 
-PROTOCOL -- emit each marker on its own line, exactly:
-  STATUS: <one short line of progress>
-  NOTE: <one short line worth remembering long-term>
-  EXECUTOR: <prompt for the executor agent>
-      ...multi-line allowed...
-  {end}
-  DONE: <reason>          (goal achieved -- ends the loop)
-  BLOCKED: <reason>       (fundamental limitation -- ends the loop)
+PROTOCOL -- produce single lines that begin (at column 0) with one of the
+tags below, followed immediately by a colon and a space. The manager
+parses these lines from the pane.
 
-The manager will forward each EXECUTOR block to the executor tmux session,
-capture its output, and paste back to you as:
-  EXECUTOR_REPLY:
-  <captured output>
-  END_EXECUTOR_REPLY
+  Tag         Purpose
+  ----------  ----------------------------------------------------------
+  STATUS      brief progress update (one short line)
+  NOTE        one short line worth remembering long-term
+  EXECUTOR    prompt for the executor agent (multi-line allowed; close
+              the block with a line whose only content is the closing
+              marker shown below)
+  DONE        goal achieved -- ends the loop
+  BLOCKED     fundamental limitation, cannot proceed -- ends the loop
+
+The closing marker for an EXECUTOR block is the literal string {end} on
+its own line.
+
+After every EXECUTOR block the manager will forward the prompt to the
+executor tmux session, capture its output, and paste it back to you
+between the markers EXECUTOR_REPLY and END_EXECUTOR_REPLY.
 
 Rules:
-  - This is an endless loop. Do not stop on your own. Only DONE or BLOCKED
-    ends it.
+  - This is an endless loop. Only DONE or BLOCKED ends it.
   - Prefer many small EXECUTOR steps over one giant prompt.
-  - After every EXECUTOR_REPLY, evaluate, emit a STATUS line, then either
-    another EXECUTOR or DONE/BLOCKED.
+  - After every reply from the executor, evaluate, emit one STATUS line,
+    then either another EXECUTOR block or DONE/BLOCKED.
   - Be terse. STATUS/NOTE lines go into a global memory file -- write as
-    little as possible, as much as needed.
+    little as possible while staying useful.
+  - Tagged lines must start at column 0; no leading prose on the same
+    line as a tag.
 
 Begin: emit one STATUS line, then your first EXECUTOR block.
 """
@@ -298,6 +306,17 @@ def main() -> int:
     if not args.no_kickoff:
         print(f"[manager] kickoff -> controller `{args.controller}`")
         tmux_send_text(args.controller, KICKOFF.format(goal=args.goal, end=END_EXECUTOR))
+        # Let the kickoff settle into the pane before baselining.
+        time.sleep(2.0)
+
+    # Baseline: any sentinel-looking lines already in the pane (kickoff echo,
+    # prior history, the user's own goal text) must NOT replay. Pre-fill the
+    # `seen` set with everything that currently parses as an event.
+    baseline_pane = tmux_capture(args.controller, args.capture_lines)
+    pre_existing = parse_events(baseline_pane, seen)
+    if pre_existing:
+        print(f"[manager] baseline-skipped {len(pre_existing)} pre-existing "
+              f"sentinel lines in controller pane")
 
     last_event_t = time.monotonic()
     last_status = ""
