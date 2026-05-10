@@ -18,8 +18,15 @@ The controller emits sentinel-prefixed lines that this script parses:
     EXECUTOR: <prompt for the executor>          (multi-line ok; end with line
                                                   containing exactly:
                                                   END_EXECUTOR)
-    DONE:    <reason>                            -> exit 0
-    BLOCKED: <reason>                            -> exit 3
+    DONE:    <reason>                            -> exit 0 (terminates)
+    BLOCKED: <reason>                            -> resume (does NOT exit):
+        the manager scans the recent controller pane for a
+        'Recommended next steps' / 'Next' / 'Suggestions' block and, if
+        found, forwards it verbatim to the executor as the next prompt and
+        keeps looping. If no such block is present, the manager pastes a
+        short request back into the controller asking it to produce one.
+    USER_INTERVENTION: <reason>                  -> exit 3 (genuinely
+        requires the human user -- missing secret, design call, auth)
 
 For every EXECUTOR block the manager pastes the prompt into the executor
 pane, waits for the pane to settle, then pastes the captured reply back to
@@ -52,9 +59,23 @@ from pathlib import Path
 
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 SENTINEL_RE = re.compile(
-    r"^\s*(?P<tag>STATUS|NOTE|DONE|BLOCKED|EXECUTOR)\s*:\s*(?P<body>.*)$"
+    r"^\s*(?P<tag>STATUS|NOTE|DONE|BLOCKED|EXECUTOR|USER_INTERVENTION)"
+    r"\s*:\s*(?P<body>.*)$"
 )
 END_EXECUTOR = "END_EXECUTOR"
+
+# Heuristic for spotting a "Recommended / Next steps / Suggestions" block in
+# the controller's pane after a BLOCKED. The header line is matched; we then
+# extend through subsequent non-blank, non-sentinel lines.
+_SUGGESTION_HEADER_RE = re.compile(
+    r"(?i)\b("
+    r"recommended(\s+next\s+steps?)?"
+    r"|next\s+(steps?|actions?|moves?|ideas?)"
+    r"|suggestions?"
+    r"|options?\s+to\s+(try|consider|unblock)"
+    r"|ideas?\s+to\s+(try|unblock)"
+    r")\b"
+)
 
 # Patterns that identify claude-code / codex UI chrome we want to strip out
 # of executor pane captures before forwarding the reply to the controller.
@@ -160,15 +181,28 @@ PROTOCOL -- produce single lines that begin (at column 0) with one of
 the tags below, followed immediately by a colon and a space. The
 manager parses these lines from the pane.
 
-  Tag         Purpose
-  ----------  ----------------------------------------------------------
-  STATUS      one short line: current picture + next sub-goal
-  NOTE        one short line of durable insight worth remembering
-  EXECUTOR    high-level sub-goal for the executor (multi-line allowed;
-              close the block with a line whose only content is the
-              closing marker shown below)
-  DONE        goal achieved -- ends the loop
-  BLOCKED     fundamental limitation, cannot proceed -- ends the loop
+  Tag                Purpose
+  -----------------  ---------------------------------------------------
+  STATUS             one short line: current picture + next sub-goal
+  NOTE               one short line of durable insight worth remembering
+  EXECUTOR           high-level sub-goal for the executor (multi-line
+                     allowed; close the block with a line whose only
+                     content is the closing marker shown below)
+  DONE               goal achieved -- ends the loop
+  BLOCKED            soft signal: you are stuck on the current sub-goal
+                     and want a different angle. Pair this sentinel with
+                     a 'Recommended next steps:' (or 'Next steps:' /
+                     'Suggestions:') section listing concrete ideas the
+                     executor could try. The manager scans the recent
+                     pane for that section and, if present, forwards it
+                     verbatim to the executor as the next prompt and the
+                     loop continues. If no such section is present, the
+                     manager will paste a request back here asking you
+                     for one. BLOCKED does NOT end the loop.
+  USER_INTERVENTION  hard escape: the goal genuinely requires the human
+                     user (missing secret, missing access, design call,
+                     external decision). Use this sparingly. Ends the
+                     loop and surfaces control to the user.
 
 The closing marker for an EXECUTOR block is the literal string {end} on
 its own line.
@@ -186,9 +220,15 @@ EXECUTOR PROMPT STYLE -- write sub-goals, not scripts.
     investigate -- do not redo the work in your own head.
 
 RULES
-  - This is an endless loop. Only DONE or BLOCKED ends it.
+  - This is an endless loop. Only DONE or USER_INTERVENTION ends it;
+    BLOCKED triggers a resume (see above) and the loop continues.
   - After every executor reply: emit one STATUS line (updated picture +
-    next sub-goal), then either an EXECUTOR block or DONE/BLOCKED.
+    next sub-goal), then either an EXECUTOR block or DONE / BLOCKED /
+    USER_INTERVENTION.
+  - When you emit BLOCKED, also write a short 'Recommended next steps:'
+    list immediately above or below it -- 1-5 concrete bullets the
+    executor can try. The manager will forward those bullets to the
+    executor verbatim as the next prompt.
   - Be terse. STATUS/NOTE lines are written verbatim to memory -- keep
     them short.
   - Tagged lines must start at column 0; no leading prose on the same
@@ -200,7 +240,17 @@ first sub-goal, then your first EXECUTOR block.
 
 NUDGE = (
     "(manager nudge) Continue the loop. Emit STATUS then "
-    "EXECUTOR/DONE/BLOCKED."
+    "EXECUTOR / DONE / BLOCKED / USER_INTERVENTION."
+)
+
+RESUME_NO_SUGGESTIONS = (
+    "(manager) BLOCKED received but no 'Recommended next steps' / "
+    "'Next steps' / 'Suggestions' section was found in your recent "
+    "output. Emit one now: a short bulleted list of concrete ideas the "
+    "executor could try to break this blocker. The manager will forward "
+    "the list to the executor and resume the loop. If the blocker truly "
+    "requires the human user (missing secret, missing access, design "
+    "call), emit USER_INTERVENTION: <reason> instead."
 )
 
 
@@ -312,6 +362,43 @@ def parse_events(pane: str, seen: set[str]) -> list[Event]:
     return out
 
 
+def extract_suggestions(pane: str, max_tail: int = 120) -> str | None:
+    """Look for a 'Recommended next steps' / 'Next steps' / 'Suggestions'
+    block in the most recent slice of the controller pane.
+
+    Scans the last ``max_tail`` lines bottom-up. The first line whose text
+    matches a suggestion-header pattern (and is not itself a sentinel) is
+    treated as the start of the block; subsequent non-blank, non-sentinel
+    lines are appended until a blank line or sentinel terminates it. Returns
+    the joined block text, or None if nothing matched.
+    """
+    lines = pane.splitlines()
+    if not lines:
+        return None
+    start = max(0, len(lines) - max_tail)
+    tail = lines[start:]
+    for i in range(len(tail) - 1, -1, -1):
+        line = tail[i]
+        if SENTINEL_RE.match(line):
+            continue
+        if not _SUGGESTION_HEADER_RE.search(line):
+            continue
+        collected = [line.rstrip()]
+        j = i + 1
+        while j < len(tail):
+            ln = tail[j].rstrip()
+            if not ln.strip():
+                break
+            if SENTINEL_RE.match(ln):
+                break
+            collected.append(ln)
+            j += 1
+        text = "\n".join(collected).strip()
+        if text:
+            return text
+    return None
+
+
 def relay_executor(
     executor: str,
     prompt: str,
@@ -376,7 +463,17 @@ def main() -> int:
                     help="Stop after this many polls (0 = unbounded).")
     ap.add_argument("--no-kickoff", action="store_true",
                     help="Skip sending the kickoff prompt (use when resuming).")
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume an in-progress controller pane that already "
+                         "contains a BLOCKED + suggestion block. Implies "
+                         "--no-kickoff. On startup the manager extracts the "
+                         "most recent 'Recommended next steps' / 'Next steps' "
+                         "/ 'Suggestions' block from the controller pane, "
+                         "forwards it to the executor, pastes the reply back "
+                         "as EXECUTOR_REPLY, and then enters the normal loop.")
     args = ap.parse_args()
+    if args.resume:
+        args.no_kickoff = True
 
     for name in (args.controller, args.executor):
         if not tmux_session_exists(name):
@@ -417,6 +514,49 @@ def main() -> int:
     if pre_existing:
         print(f"[manager] baseline-skipped {len(pre_existing)} pre-existing "
               f"sentinel lines in controller pane")
+
+    # One-shot resume: the user pointed us at an existing controller pane that
+    # already has a BLOCKED + suggestion block in it. The baseline above just
+    # marked that BLOCKED as 'seen', so the normal loop would never trigger
+    # the resume branch. Do it explicitly here, once, before entering the
+    # poll loop.
+    if args.resume:
+        suggestions = extract_suggestions(baseline_pane)
+        if suggestions:
+            head = suggestions.splitlines()[0][:80]
+            ts = now_iso()
+            memory_append(
+                memory_path,
+                f"- {ts} RESUME: forwarding suggestions to executor: "
+                f"{head!r}",
+            )
+            print(
+                f"[manager] resume: forwarding suggestions to executor "
+                f"({len(suggestions)} chars)"
+            )
+            reply = relay_executor(
+                args.executor,
+                suggestions,
+                args.capture_lines,
+                args.executor_settle,
+                args.executor_timeout,
+            )
+            tmux_send_text(
+                args.controller,
+                f"EXECUTOR_REPLY:\n{reply}\nEND_EXECUTOR_REPLY",
+            )
+        else:
+            ts = now_iso()
+            memory_append(
+                memory_path,
+                f"- {ts} RESUME: no suggestions found, "
+                f"asking controller to produce one",
+            )
+            print(
+                "[manager] resume: no Recommended/Next/Suggestions block "
+                "found in controller pane; asking controller for one"
+            )
+            tmux_send_text(args.controller, RESUME_NO_SUGGESTIONS)
 
     last_event_t = time.monotonic()
     last_status = ""
@@ -472,12 +612,58 @@ def main() -> int:
                         args.controller,
                         f"EXECUTOR_REPLY:\n{reply}\nEND_EXECUTOR_REPLY",
                     )
-                elif ev.tag in ("DONE", "BLOCKED"):
-                    memory_append(memory_path, f"- {ts} {ev.tag}: {ev.body}")
-                    print(f"[manager] {ev.tag}: {ev.body}")
-                    rc = 0 if ev.tag == "DONE" else 3
+                elif ev.tag == "DONE":
+                    memory_append(memory_path, f"- {ts} DONE: {ev.body}")
+                    print(f"[manager] DONE: {ev.body}")
+                    rc = 0
                     terminated = True
                     break
+                elif ev.tag == "USER_INTERVENTION":
+                    memory_append(
+                        memory_path,
+                        f"- {ts} USER_INTERVENTION: {ev.body}",
+                    )
+                    print(f"[manager] USER_INTERVENTION: {ev.body}")
+                    rc = 3
+                    terminated = True
+                    break
+                elif ev.tag == "BLOCKED":
+                    suggestions = extract_suggestions(pane)
+                    if suggestions:
+                        head = suggestions.splitlines()[0][:80]
+                        memory_append(
+                            memory_path,
+                            f"- {ts} BLOCKED: {ev.body} -- "
+                            f"resuming via suggestions: {head!r}",
+                        )
+                        print(
+                            f"[manager] BLOCKED: {ev.body} -- "
+                            f"forwarding suggestions to executor "
+                            f"({len(suggestions)} chars)"
+                        )
+                        reply = relay_executor(
+                            args.executor,
+                            suggestions,
+                            args.capture_lines,
+                            args.executor_settle,
+                            args.executor_timeout,
+                        )
+                        tmux_send_text(
+                            args.controller,
+                            f"EXECUTOR_REPLY:\n{reply}\nEND_EXECUTOR_REPLY",
+                        )
+                    else:
+                        memory_append(
+                            memory_path,
+                            f"- {ts} BLOCKED: {ev.body} -- "
+                            f"no suggestions found, requesting from controller",
+                        )
+                        print(
+                            f"[manager] BLOCKED: {ev.body} -- "
+                            f"no Recommended/Next/Suggestions block found, "
+                            f"asking controller for one"
+                        )
+                        tmux_send_text(args.controller, RESUME_NO_SUGGESTIONS)
             if terminated:
                 break
     finally:
