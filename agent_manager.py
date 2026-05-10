@@ -59,10 +59,28 @@ from pathlib import Path
 
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 SENTINEL_RE = re.compile(
-    r"^\s*(?P<tag>STATUS|NOTE|DONE|BLOCKED|EXECUTOR|USER_INTERVENTION)"
+    r"^\s*(?P<tag>STATUS|NOTE|DONE|BLOCKED|EXECUTOR|MEMORY|WAIT|USER_INTERVENTION)"
     r"\s*:\s*(?P<body>.*)$"
 )
 END_EXECUTOR = "END_EXECUTOR"
+END_MEMORY = "END_MEMORY"
+
+# Multi-line block tags: tag -> (closing marker, auto_close_on_sentinel).
+# auto_close_on_sentinel keeps the parser robust against a controller that
+# forgets the explicit closer; for MEMORY we keep that same behaviour because
+# the controller is told (in KICKOFF) that tagged lines must start at column
+# 0, so authentic markdown notes inside a MEMORY block won't accidentally
+# trigger a false close.
+_MULTILINE_BLOCKS = {
+    "EXECUTOR": (END_EXECUTOR, True),
+    "MEMORY":   (END_MEMORY,   True),
+}
+
+# Markers that delimit the controller-owned region of the memory file. The
+# controller rewrites the contents between these markers via MEMORY blocks;
+# the manager's auto-log lives below the end marker, untouched.
+MEMORY_BEGIN_MARK = "<!-- begin:controller-memory -->"
+MEMORY_END_MARK = "<!-- end:controller-memory -->"
 
 # Heuristic for spotting a "Recommended / Next steps / Suggestions" block in
 # the controller's pane after a BLOCKED. The header line is matched; we then
@@ -170,12 +188,43 @@ On every iteration of the loop:
      what you thought was true, revise the plan. Record the new
      picture as a STATUS line and any durable insight as a NOTE line.
 
-EXTERNAL MEMORY. The manager appends every STATUS and NOTE line to a
-memory file outside this pane -- treat that stream as your durable plan
-ledger. Do not rely on chat scrollback to remember the plan: re-emit a
-fresh STATUS whenever the plan shifts, and capture hard-won facts
-(assumptions invalidated, surprising constraints, decisions made) as
-NOTE lines so they survive context loss.
+EXTERNAL MEMORY. The manager keeps a durable memory file for you at:
+
+  {memory_path}
+
+It has two zones, and you should treat them differently.
+
+  1. A controller-owned region delimited by these markers in the file:
+
+       <!-- begin:controller-memory -->
+       ...your curated notes...
+       <!-- end:controller-memory -->
+
+     This region is YOURS. Shape it however serves you best -- a
+     decisions log, an open-questions list, a fact table, a glossary,
+     a plan tree, a freeform brief. Read the file at the start of a
+     session if you're picking up prior work, then update the region
+     by emitting:
+
+         MEMORY:
+         <freeform markdown -- whatever structure you prefer>
+         {end_memory}
+
+     The block REPLACES everything between the two markers, so include
+     the full curated state you want preserved (not a delta). Re-emit
+     MEMORY whenever the picture meaningfully changes; you can do so
+     as often as you like.
+
+  2. An auto-appended audit log below the end marker. The manager
+     timestamps and appends every STATUS / NOTE / DONE / BLOCKED line
+     you emit, plus run boundaries and executor handoffs. You cannot
+     edit this part; treat it as a write-only ledger the manager
+     maintains for traceability.
+
+Do not rely on chat scrollback to remember the plan: re-emit a fresh
+STATUS whenever the plan shifts, capture hard-won facts as NOTE lines
+so they survive context loss, and use MEMORY blocks to keep the
+curated region a faithful summary of where things stand.
 
 PROTOCOL -- produce single lines that begin (at column 0) with one of
 the tags below, followed immediately by a colon and a space. The
@@ -188,6 +237,21 @@ manager parses these lines from the pane.
   EXECUTOR           high-level sub-goal for the executor (multi-line
                      allowed; close the block with a line whose only
                      content is the closing marker shown below)
+  MEMORY             freeform markdown that REPLACES the controller-
+                     owned region of the memory file. Multi-line; close
+                     the block with the MEMORY closing marker shown
+                     below. See the EXTERNAL MEMORY section above.
+  WAIT               ask the manager to suppress its inactivity-nudge
+                     for the given duration. Body is a number (seconds)
+                     or a value with a unit suffix: ms / s / m / h
+                     (e.g. 'WAIT: 90', 'WAIT: 5m', 'WAIT: 1h'). The
+                     manager keeps polling the pane for new sentinels;
+                     it just stops sending the periodic nudge until the
+                     deadline passes or you emit any new event.
+                     Subsequent WAIT replaces the prior deadline. Use
+                     this when you need time to think, or when an
+                     external process must finish before the next
+                     sub-goal is meaningful.
   DONE               goal achieved -- ends the loop
   BLOCKED            soft signal: you are stuck on the current sub-goal
                      and want a different angle. Pair this sentinel with
@@ -204,8 +268,9 @@ manager parses these lines from the pane.
                      external decision). Use this sparingly. Ends the
                      loop and surfaces control to the user.
 
-The closing marker for an EXECUTOR block is the literal string {end} on
-its own line.
+The closing markers (each on its own line, no surrounding prose) are:
+  {end}        -- closes an EXECUTOR block
+  {end_memory} -- closes a MEMORY block
 
 After every EXECUTOR block the manager forwards the prompt to the
 executor tmux session, captures its output, and pastes it back to you
@@ -256,6 +321,30 @@ RESUME_NO_SUGGESTIONS = (
 
 def strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s)
+
+
+def parse_wait(body: str) -> float | None:
+    """Parse a WAIT sentinel body into a positive number of seconds.
+
+    Accepts a bare number (treated as seconds) or one of the unit
+    suffixes ``ms`` / ``s`` / ``m`` / ``h``. Whitespace is tolerated.
+    Returns None if the body is missing, non-numeric, or non-positive.
+    """
+    s = body.strip().lower()
+    if not s:
+        return None
+    multiplier = 1.0
+    if s.endswith("ms"):
+        multiplier, s = 0.001, s[:-2]
+    elif s.endswith(("s", "m", "h")):
+        multiplier, s = {"s": 1.0, "m": 60.0, "h": 3600.0}[s[-1]], s[:-1]
+    try:
+        v = float(s.strip())
+    except ValueError:
+        return None
+    if v <= 0:
+        return None
+    return v * multiplier
 
 
 def sh(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -316,7 +405,8 @@ def parse_events(pane: str, seen: set[str]) -> list[Event]:
         tag = m.group("tag")
         body = m.group("body").rstrip()
 
-        if tag == "EXECUTOR":
+        if tag in _MULTILINE_BLOCKS:
+            closer, auto_close_on_sentinel = _MULTILINE_BLOCKS[tag]
             collected = [line]
             payload: list[str] = []
             if body:
@@ -326,13 +416,13 @@ def parse_events(pane: str, seen: set[str]) -> list[Event]:
             auto_closed = False
             while j < len(raw):
                 stripped = raw[j].strip()
-                if stripped == END_EXECUTOR:
+                if stripped == closer:
                     collected.append(raw[j])
                     closed = True
                     break
                 # Auto-close on a new sentinel: prevents an unterminated
-                # EXECUTOR block from swallowing later DONE/BLOCKED lines.
-                if SENTINEL_RE.match(raw[j]):
+                # block from swallowing later DONE/BLOCKED lines.
+                if auto_close_on_sentinel and SENTINEL_RE.match(raw[j]):
                     auto_closed = True
                     break
                 collected.append(raw[j])
@@ -368,9 +458,14 @@ def extract_suggestions(pane: str, max_tail: int = 120) -> str | None:
 
     Scans the last ``max_tail`` lines bottom-up. The first line whose text
     matches a suggestion-header pattern (and is not itself a sentinel) is
-    treated as the start of the block; subsequent non-blank, non-sentinel
-    lines are appended until a blank line or sentinel terminates it. Returns
-    the joined block text, or None if nothing matched.
+    treated as the start of the block. Subsequent lines are appended --
+    including blank separators and follow-on paragraphs (extra context,
+    constraints, caveats the controller wrote after the bulleted list) --
+    until a sentinel line or the end of the pane terminates the block.
+    Trailing blanks are trimmed and UI chrome (spinners, prompt boxes,
+    box-drawing) is stripped via ``clean_pane_text`` so the forwarded
+    prompt is just the controller's prose. Returns the joined block text,
+    or None if nothing matched.
     """
     lines = pane.splitlines()
     if not lines:
@@ -387,13 +482,13 @@ def extract_suggestions(pane: str, max_tail: int = 120) -> str | None:
         j = i + 1
         while j < len(tail):
             ln = tail[j].rstrip()
-            if not ln.strip():
-                break
             if SENTINEL_RE.match(ln):
                 break
             collected.append(ln)
             j += 1
-        text = "\n".join(collected).strip()
+        while collected and not collected[-1].strip():
+            collected.pop()
+        text = clean_pane_text("\n".join(collected)).strip()
         if text:
             return text
     return None
@@ -432,10 +527,69 @@ def now_iso() -> str:
     return dt.datetime.now().isoformat(timespec="seconds")
 
 
-def memory_append(path: Path, line: str) -> None:
+def _ensure_memory_markers(path: Path) -> None:
+    """Make sure the memory file exists and contains a controller-owned
+    region delimited by ``MEMORY_BEGIN_MARK`` / ``MEMORY_END_MARK``.
+
+    Creates a fresh file with an empty region if missing, and inserts the
+    markers near the top of an existing file that pre-dates this feature.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
-        path.write_text("# Agent Manager Memory\n")
+        path.write_text(
+            "# Agent Manager Memory\n\n"
+            f"{MEMORY_BEGIN_MARK}\n{MEMORY_END_MARK}\n"
+        )
+        return
+    text = path.read_text()
+    if MEMORY_BEGIN_MARK in text and MEMORY_END_MARK in text:
+        return
+    lines = text.splitlines(keepends=True)
+    insert_at = 0
+    if lines and lines[0].startswith("#"):
+        insert_at = 1
+        if insert_at < len(lines) and not lines[insert_at].strip():
+            insert_at += 1
+    block = f"{MEMORY_BEGIN_MARK}\n{MEMORY_END_MARK}\n\n"
+    lines.insert(insert_at, block)
+    path.write_text("".join(lines))
+
+
+def read_controller_memory(path: Path) -> str:
+    """Return the contents of the controller-owned region (without the
+    surrounding markers), or '' if the file or region is missing."""
+    if not path.exists():
+        return ""
+    text = path.read_text()
+    b = text.find(MEMORY_BEGIN_MARK)
+    e = text.find(MEMORY_END_MARK)
+    if b < 0 or e < 0 or e <= b:
+        return ""
+    return text[b + len(MEMORY_BEGIN_MARK):e].strip("\n")
+
+
+def write_controller_memory(path: Path, content: str) -> None:
+    """Replace the contents of the controller-owned region with ``content``.
+
+    The auto-log below the end marker is preserved verbatim.
+    """
+    _ensure_memory_markers(path)
+    text = path.read_text()
+    b = text.find(MEMORY_BEGIN_MARK)
+    e = text.find(MEMORY_END_MARK)
+    if b < 0 or e < 0 or e <= b:
+        return
+    body = content.rstrip()
+    new = (
+        text[:b + len(MEMORY_BEGIN_MARK)]
+        + ("\n" + body + "\n" if body else "\n")
+        + text[e:]
+    )
+    path.write_text(new)
+
+
+def memory_append(path: Path, line: str) -> None:
+    _ensure_memory_markers(path)
     with path.open("a") as f:
         f.write(line.rstrip() + "\n")
 
@@ -445,7 +599,10 @@ def main() -> int:
         description="Drive a controller<->executor agent loop in tmux.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--goal", required=True, help="Goal the controller must achieve.")
+    ap.add_argument("--goal", help="Goal the controller must achieve "
+                    "(inline string). Mutually exclusive with --goal-file.")
+    ap.add_argument("--goal-file", help="Path to a file whose contents are "
+                    "used as the goal. Mutually exclusive with --goal.")
     ap.add_argument("--controller", required=True, help="tmux session of controller agent.")
     ap.add_argument("--executor", required=True, help="tmux session of executor agent.")
     ap.add_argument("--memory", default="./MEMORY.md", help="Path to memory markdown.")
@@ -475,6 +632,22 @@ def main() -> int:
     if args.resume:
         args.no_kickoff = True
 
+    if bool(args.goal) == bool(args.goal_file):
+        print("error: provide exactly one of --goal or --goal-file",
+              file=sys.stderr)
+        return 2
+    if args.goal_file:
+        try:
+            args.goal = Path(args.goal_file).read_text().strip()
+        except OSError as e:
+            print(f"error: cannot read --goal-file {args.goal_file}: {e}",
+                  file=sys.stderr)
+            return 2
+        if not args.goal:
+            print(f"error: --goal-file {args.goal_file} is empty",
+                  file=sys.stderr)
+            return 2
+
     for name in (args.controller, args.executor):
         if not tmux_session_exists(name):
             print(f"error: tmux session not found: {name}", file=sys.stderr)
@@ -502,7 +675,12 @@ def main() -> int:
 
     if not args.no_kickoff:
         print(f"[manager] kickoff -> controller `{args.controller}`")
-        tmux_send_text(args.controller, KICKOFF.format(goal=args.goal, end=END_EXECUTOR))
+        tmux_send_text(args.controller, KICKOFF.format(
+            goal=args.goal,
+            memory_path=str(memory_path),
+            end=END_EXECUTOR,
+            end_memory=END_MEMORY,
+        ))
         # Let the kickoff settle into the pane before baselining.
         time.sleep(2.0)
 
@@ -560,6 +738,7 @@ def main() -> int:
 
     last_event_t = time.monotonic()
     last_status = ""
+    wait_until = 0.0
     iters = 0
     rc = 1
     try:
@@ -580,10 +759,13 @@ def main() -> int:
             events = parse_events(pane, seen)
 
             if not events:
-                if time.monotonic() - last_event_t > args.nudge_after:
+                now = time.monotonic()
+                if now < wait_until:
+                    continue
+                if now - last_event_t > args.nudge_after:
                     print("[manager] nudging controller")
                     tmux_send_text(args.controller, NUDGE)
-                    last_event_t = time.monotonic()
+                    last_event_t = now
                 continue
 
             terminated = False
@@ -598,6 +780,41 @@ def main() -> int:
                 elif ev.tag == "NOTE":
                     memory_append(memory_path, f"- {ts} NOTE: {ev.body}")
                     print(f"[manager] NOTE: {ev.body}")
+                elif ev.tag == "MEMORY":
+                    write_controller_memory(memory_path, ev.body)
+                    n_lines = len(ev.body.splitlines())
+                    memory_append(
+                        memory_path,
+                        f"- {ts} MEMORY: controller rewrote curated "
+                        f"region ({n_lines} lines)",
+                    )
+                    print(
+                        f"[manager] MEMORY: rewrote curated region "
+                        f"({n_lines} lines, {len(ev.body)} chars)"
+                    )
+                elif ev.tag == "WAIT":
+                    secs = parse_wait(ev.body)
+                    if secs is None:
+                        memory_append(
+                            memory_path,
+                            f"- {ts} WAIT: invalid duration "
+                            f"{ev.body!r} -- ignoring",
+                        )
+                        print(
+                            f"[manager] WAIT: invalid duration "
+                            f"{ev.body!r}; ignoring"
+                        )
+                    else:
+                        wait_until = time.monotonic() + secs
+                        memory_append(
+                            memory_path,
+                            f"- {ts} WAIT: suppressing nudges for "
+                            f"{secs:g}s",
+                        )
+                        print(
+                            f"[manager] WAIT: suppressing nudges for "
+                            f"{secs:g}s"
+                        )
                 elif ev.tag == "EXECUTOR":
                     head = ev.body.splitlines()[0][:80] if ev.body else ""
                     print(f"[manager] EXECUTOR -> {args.executor}: {head!r}")
